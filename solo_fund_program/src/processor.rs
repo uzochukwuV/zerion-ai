@@ -72,15 +72,13 @@ fn process_initialize(
         return Err(EscrowError::InvalidInstruction.into());
     }
 
-    let creator = &accounts[0];
-    if !creator.is_signer {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-
     match asset {
         Asset::Sol => {
             let mut it = accounts.iter();
             let creator = next_account_info(&mut it)?;
+            if !creator.is_signer {
+                return Err(ProgramError::MissingRequiredSignature);
+            }
             let state_info = next_account_info(&mut it)?;
             let vault_info = next_account_info(&mut it)?;
             let system_program = next_account_info(&mut it)?;
@@ -129,7 +127,7 @@ fn process_initialize(
             )?;
 
             invoke_signed(
-                &system_instruction::create_account(creator.key, vault_info.key, 0, 0, program_id),
+                &system_instruction::create_account(creator.key, vault_info.key, 1, 0, program_id),
                 &[creator.clone(), vault_info.clone(), system_program.clone()],
                 &[&[b"vault", state_info.key.as_ref(), &[vault_bump]]],
             )?;
@@ -155,6 +153,9 @@ fn process_initialize(
 
             let mut it = accounts.iter();
             let creator = next_account_info(&mut it)?;
+            if !creator.is_signer {
+                return Err(ProgramError::MissingRequiredSignature);
+            }
             let state_info = next_account_info(&mut it)?;
             let vault_authority = next_account_info(&mut it)?;
             let vault_ata = next_account_info(&mut it)?;
@@ -273,15 +274,6 @@ fn process_fund(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -> P
     let state_info = next_account_info(&mut it)?;
     let mut state = ProjectState::try_from_slice(&state_info.data.borrow())?;
 
-    let clock_sysvar = accounts.last().ok_or(EscrowError::InvalidInstruction)?;
-    if *clock_sysvar.key != solana_program::sysvar::clock::id() {
-        return Err(EscrowError::InvalidInstruction.into());
-    }
-    let clock = Clock::from_account_info(clock_sysvar)?;
-    if clock.unix_timestamp >= state.deadline_unix_ts {
-        return Err(EscrowError::FundingClosed.into());
-    }
-
     let new_total = state
         .total_funded
         .checked_add(amount)
@@ -294,6 +286,7 @@ fn process_fund(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -> P
         0 => {
             let vault_info = next_account_info(&mut it)?;
             let system_program = next_account_info(&mut it)?;
+            let clock_sysvar = next_account_info(&mut it)?;
 
             let creator = Pubkey::new_from_array(state.creator);
             let (expected_state, _) = derive_state_pda(program_id, &creator, state.project_id);
@@ -309,6 +302,14 @@ fn process_fund(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -> P
                 return Err(EscrowError::InvalidPda.into());
             }
 
+            if *clock_sysvar.key != solana_program::sysvar::clock::id() {
+                return Err(EscrowError::InvalidInstruction.into());
+            }
+            let clock = Clock::from_account_info(clock_sysvar)?;
+            if clock.unix_timestamp >= state.deadline_unix_ts {
+                return Err(EscrowError::FundingClosed.into());
+            }
+
             invoke(
                 &system_instruction::transfer(funder.key, vault_info.key, amount),
                 &[funder.clone(), vault_info.clone(), system_program.clone()],
@@ -319,6 +320,7 @@ fn process_fund(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -> P
             let vault_authority = next_account_info(&mut it)?;
             let vault_ata = next_account_info(&mut it)?;
             let token_program = next_account_info(&mut it)?;
+            let clock_sysvar = next_account_info(&mut it)?;
 
             if *token_program.key != spl_token::id() {
                 return Err(ProgramError::IncorrectProgramId);
@@ -342,6 +344,14 @@ fn process_fund(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -> P
             }
             if vault_bump != state.vault_bump {
                 return Err(EscrowError::InvalidPda.into());
+            }
+
+            if *clock_sysvar.key != solana_program::sysvar::clock::id() {
+                return Err(EscrowError::InvalidInstruction.into());
+            }
+            let clock = Clock::from_account_info(clock_sysvar)?;
+            if clock.unix_timestamp >= state.deadline_unix_ts {
+                return Err(EscrowError::FundingClosed.into());
             }
 
             let ix = spl_token::instruction::transfer(
@@ -383,22 +393,14 @@ fn process_withdraw(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramRes
         return Err(ProgramError::IllegalOwner);
     }
 
-    let clock_sysvar = accounts.last().ok_or(EscrowError::InvalidInstruction)?;
-    if *clock_sysvar.key != solana_program::sysvar::clock::id() {
-        return Err(EscrowError::InvalidInstruction.into());
-    }
-    let clock = Clock::from_account_info(clock_sysvar)?;
-    if clock.unix_timestamp < state.deadline_unix_ts {
-        return Err(EscrowError::DeadlineNotReached.into());
-    }
-
     let treasury = treasury_pubkey();
 
     match state.asset_kind {
         0 => {
             let vault_info = next_account_info(&mut it)?;
             let treasury_info = next_account_info(&mut it)?;
-            let system_program = next_account_info(&mut it)?;
+            let _system_program = next_account_info(&mut it)?;
+            let clock_sysvar = next_account_info(&mut it)?;
 
             if *treasury_info.key != treasury {
                 return Err(EscrowError::InvalidTreasury.into());
@@ -417,25 +419,43 @@ fn process_withdraw(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramRes
                 return Err(EscrowError::InvalidPda.into());
             }
 
-            let amount = vault_info.lamports();
-            let fee = amount / 100;
-            let payout = amount
+            if *clock_sysvar.key != solana_program::sysvar::clock::id() {
+                return Err(EscrowError::InvalidInstruction.into());
+            }
+            let clock = Clock::from_account_info(clock_sysvar)?;
+            if clock.unix_timestamp < state.deadline_unix_ts {
+                return Err(EscrowError::DeadlineNotReached.into());
+            }
+
+            let distributable = state.total_funded;
+            let vault_balance = **vault_info.lamports.borrow();
+            if vault_balance < distributable {
+                return Err(EscrowError::MathOverflow.into());
+            }
+
+            let fee = distributable / 100;
+            let payout = distributable
                 .checked_sub(fee)
                 .ok_or(EscrowError::MathOverflow)?;
 
+            {
+                let mut vault_lamports = vault_info.lamports.borrow_mut();
+                **vault_lamports = (**vault_lamports)
+                    .checked_sub(distributable)
+                    .ok_or(EscrowError::MathOverflow)?;
+            }
+
             if fee > 0 {
-                invoke_signed(
-                    &system_instruction::transfer(vault_info.key, treasury_info.key, fee),
-                    &[vault_info.clone(), treasury_info.clone(), system_program.clone()],
-                    &[&[b"vault", state_info.key.as_ref(), &[vault_bump]]],
-                )?;
+                let mut treasury_lamports = treasury_info.lamports.borrow_mut();
+                **treasury_lamports = (**treasury_lamports)
+                    .checked_add(fee)
+                    .ok_or(EscrowError::MathOverflow)?;
             }
             if payout > 0 {
-                invoke_signed(
-                    &system_instruction::transfer(vault_info.key, creator.key, payout),
-                    &[vault_info.clone(), creator.clone(), system_program.clone()],
-                    &[&[b"vault", state_info.key.as_ref(), &[vault_bump]]],
-                )?;
+                let mut creator_lamports = creator.lamports.borrow_mut();
+                **creator_lamports = (**creator_lamports)
+                    .checked_add(payout)
+                    .ok_or(EscrowError::MathOverflow)?;
             }
 
             Ok(())
@@ -446,9 +466,18 @@ fn process_withdraw(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramRes
             let creator_ata = next_account_info(&mut it)?;
             let treasury_ata = next_account_info(&mut it)?;
             let token_program = next_account_info(&mut it)?;
+            let clock_sysvar = next_account_info(&mut it)?;
 
             if *token_program.key != spl_token::id() {
                 return Err(ProgramError::IncorrectProgramId);
+            }
+
+            if *clock_sysvar.key != solana_program::sysvar::clock::id() {
+                return Err(EscrowError::InvalidInstruction.into());
+            }
+            let clock = Clock::from_account_info(clock_sysvar)?;
+            if clock.unix_timestamp < state.deadline_unix_ts {
+                return Err(EscrowError::DeadlineNotReached.into());
             }
 
             let mint = Pubkey::new_from_array(state.mint);
