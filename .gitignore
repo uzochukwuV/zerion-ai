@@ -6,3 +6,4 @@ node_modules/
 *.bak
 AGENTS.md
 keys/
+program-keypair.json
